@@ -54,20 +54,35 @@ def download():
         try:
             args = shlex.split(raw)
 
-            # Try browsers in order for cookie extraction
+            # ── Cookie resolution (browser > cookies.txt > none) ──
             cookie_args = []
-            for browser in ["chrome", "firefox", "edge", "chromium"]:
-                try:
-                    test = subprocess.run(
-                        ["yt-dlp", "--cookies-from-browser", browser, "--skip-download",
-                         "--quiet", "https://www.youtube.com/watch?v=dQw4w9WgXcQ"],
-                        capture_output=True, text=True, timeout=10
-                    )
-                    if test.returncode == 0 or "Sign in" not in test.stderr:
-                        cookie_args = ["--cookies-from-browser", browser]
-                        break
-                except Exception:
-                    continue
+            user_has_cookies = "--cookies" in raw or "--cookies-from-browser" in raw
+
+            if not user_has_cookies:
+                for browser in ["chrome", "firefox", "edge", "chromium"]:
+                    try:
+                        probe = subprocess.run(
+                            ["yt-dlp", "--cookies-from-browser", browser,
+                             "--skip-download", "--quiet", "--no-warnings",
+                             "https://www.youtube.com/watch?v=dQw4w9WgXcQ"],
+                            capture_output=True, text=True, timeout=8
+                        )
+                        if probe.returncode == 0:
+                            cookie_args = ["--cookies-from-browser", browser]
+                            break
+                    except Exception:
+                        continue
+                else:
+                    cookies_file = Path("cookies.txt")
+                    if cookies_file.exists():
+                        cookie_args = ["--cookies", str(cookies_file)]
+
+            # ── Build final command ──
+            output_tpl = (
+                "download/%(playlist_index)s-%(title)s.%(ext)s"
+                if any(a in raw for a in ["--playlist", "playlist_items", "playlist-start"])
+                else "download/%(title)s.%(ext)s"
+            )
 
             cmd = [
                 "yt-dlp",
@@ -77,20 +92,36 @@ def download():
                 "--no-check-certificates",
                 "--restrict-filenames",
                 "--no-part",
-                "--js-runtimes", "deno",
-            ] + cookie_args + [
-                "-o", "download/%(playlist_index)s-%(title)s.%(ext)s"
-                       if any(a in raw for a in ["--playlist", "playlist_items", "playlist-start"])
-                       else "download/%(title)s.%(ext)s",
-            ] + args
+                # Bypass bot-detection & JS-runtime requirement
+                "--extractor-args", "youtube:player_client=tv_embedded,android,web",
+                "--extractor-args", "youtube:player_skip=webpage",
+                "-o", output_tpl,
+            ] + cookie_args + args
 
-            # Remove duplicate -o and --cookies-from-browser flags from user args
-            filtered, skip = [], False
-            for i, a in enumerate(cmd):
-                if skip: skip = False; continue
-                if a == "-o" and i > 12: skip = True; continue
-                if a == "--cookies-from-browser" and i > 12: skip = True; continue
+            # ── Remove duplicate flags that user may have also supplied ──
+            seen_o = False
+            seen_cookies = False
+            filtered = []
+            i = 0
+            while i < len(cmd):
+                a = cmd[i]
+                # Keep the first -o (our injected one), drop later ones
+                if a == "-o":
+                    if not seen_o:
+                        seen_o = True
+                        filtered += [a, cmd[i+1]]
+                        i += 2
+                    else:
+                        i += 2  # skip duplicate -o value
+                    continue
+                # Keep only our injected --cookies-from-browser / --cookies
+                if a in ("--cookies-from-browser", "--cookies") and seen_cookies:
+                    i += 2
+                    continue
+                if a in ("--cookies-from-browser", "--cookies"):
+                    seen_cookies = True
                 filtered.append(a)
+                i += 1
 
             # Track files seen before this run
             before = set(f.name for f in DOWNLOAD_DIR.iterdir() if f.is_file())
@@ -169,7 +200,6 @@ def download():
                 }) + "\n"
 
             if process.returncode == 0:
-                # pick most recent file for "done" event
                 all_files = sorted(DOWNLOAD_DIR.iterdir(),
                                    key=lambda f: f.stat().st_mtime, reverse=True)
                 final = all_files[0].name if all_files else (last_filename or "video.mp4")
