@@ -1,5 +1,5 @@
 """
-VidGrab Backend v2.0 — Flask + yt-dlp
+VidGrab Backend v3.0 — Flask + yt-dlp
 ======================================
 pip install flask flask-cors yt-dlp gunicorn
 python app.py
@@ -15,6 +15,7 @@ CORS(app)
 
 DOWNLOAD_DIR = Path("download")
 DOWNLOAD_DIR.mkdir(exist_ok=True)
+COOKIES_FILE = Path("cookies.txt")
 
 # ── Auto-clean files older than 1 hour ──
 def clean_old_files():
@@ -34,7 +35,40 @@ threading.Thread(target=clean_old_files, daemon=True).start()
 
 @app.route("/", methods=["GET"])
 def index():
-    return jsonify({"status": "VidGrab v2.0 running", "version": "2.0"})
+    return jsonify({
+        "status": "VidGrab v3.0 running",
+        "version": "3.0",
+        "cookies_loaded": COOKIES_FILE.exists()
+    })
+
+
+# ── Upload cookies.txt ──
+@app.route("/upload-cookies", methods=["POST"])
+def upload_cookies():
+    if "file" not in request.files:
+        return jsonify({"error": "No file sent"}), 400
+    f = request.files["file"]
+    if not f.filename.endswith(".txt"):
+        return jsonify({"error": "Must be a .txt file"}), 400
+    content = f.read().decode("utf-8", errors="ignore")
+    if "youtube.com" not in content and "HTTP Cookie" not in content and "Netscape" not in content:
+        return jsonify({"error": "Doesn't look like a valid cookies file"}), 400
+    COOKIES_FILE.write_text(content)
+    return jsonify({"success": True, "message": "cookies.txt saved!"})
+
+
+# ── Cookie status ──
+@app.route("/cookie-status", methods=["GET"])
+def cookie_status():
+    return jsonify({"active": COOKIES_FILE.exists()})
+
+
+# ── Delete cookies ──
+@app.route("/delete-cookies", methods=["DELETE"])
+def delete_cookies():
+    if COOKIES_FILE.exists():
+        COOKIES_FILE.unlink()
+    return jsonify({"success": True})
 
 
 @app.route("/download", methods=["POST"])
@@ -54,11 +88,12 @@ def download():
         try:
             args = shlex.split(raw)
 
-            # ── Cookie resolution (browser > cookies.txt > none) ──
+            # ── Cookie resolution ──
             cookie_args = []
             user_has_cookies = "--cookies" in raw or "--cookies-from-browser" in raw
 
             if not user_has_cookies:
+                # 1) Try browser cookies (works on local machines)
                 for browser in ["chrome", "firefox", "edge", "chromium"]:
                     try:
                         probe = subprocess.run(
@@ -72,12 +107,12 @@ def download():
                             break
                     except Exception:
                         continue
-                else:
-                    cookies_file = Path("cookies.txt")
-                    if cookies_file.exists():
-                        cookie_args = ["--cookies", str(cookies_file)]
 
-            # ── Build final command ──
+                # 2) Fall back to uploaded cookies.txt
+                if not cookie_args and COOKIES_FILE.exists():
+                    cookie_args = ["--cookies", str(COOKIES_FILE)]
+
+            # ── Build command ──
             output_tpl = (
                 "download/%(playlist_index)s-%(title)s.%(ext)s"
                 if any(a in raw for a in ["--playlist", "playlist_items", "playlist-start"])
@@ -92,38 +127,35 @@ def download():
                 "--no-check-certificates",
                 "--restrict-filenames",
                 "--no-part",
-                # Bypass bot-detection & JS-runtime requirement
+                # Bypass bot-detection
                 "--extractor-args", "youtube:player_client=tv_embedded,android,web",
                 "--extractor-args", "youtube:player_skip=webpage",
                 "-o", output_tpl,
             ] + cookie_args + args
 
-            # ── Remove duplicate flags that user may have also supplied ──
+            # ── Remove duplicate flags ──
             seen_o = False
             seen_cookies = False
             filtered = []
             i = 0
             while i < len(cmd):
                 a = cmd[i]
-                # Keep the first -o (our injected one), drop later ones
                 if a == "-o":
                     if not seen_o:
                         seen_o = True
                         filtered += [a, cmd[i+1]]
-                        i += 2
-                    else:
-                        i += 2  # skip duplicate -o value
-                    continue
-                # Keep only our injected --cookies-from-browser / --cookies
-                if a in ("--cookies-from-browser", "--cookies") and seen_cookies:
                     i += 2
                     continue
                 if a in ("--cookies-from-browser", "--cookies"):
-                    seen_cookies = True
+                    if not seen_cookies:
+                        seen_cookies = True
+                        filtered += [a, cmd[i+1]]
+                    i += 2
+                    continue
                 filtered.append(a)
                 i += 1
 
-            # Track files seen before this run
+            # Track files before run
             before = set(f.name for f in DOWNLOAD_DIR.iterdir() if f.is_file())
             seen_ready = set()
 
@@ -145,7 +177,6 @@ def download():
 
                 yield json.dumps({"type": "log", "text": line}) + "\n"
 
-                # Track destination
                 m = re.search(r'Destination:\s+download/(.+)', line)
                 if m:
                     last_filename = m.group(1)
@@ -156,47 +187,39 @@ def download():
                     last_filename = m2.group(1)
                     merging = True
 
-                # Track size
                 sm = re.search(r'of\s+([\d.]+\s*\w+)\s+in', line)
                 if sm:
                     last_size = sm[0].replace("of ", "").split(" in")[0].strip()
 
-                # Detect "Deleting original" = merge done, file ready
                 if "Deleting original file" in line and merging and last_filename:
                     fp = DOWNLOAD_DIR / last_filename
                     if fp.exists() and last_filename not in seen_ready:
                         seen_ready.add(last_filename)
-                        fsize = _fmt_size(fp.stat().st_size)
                         yield json.dumps({
                             "type": "file_ready",
                             "filename": last_filename,
-                            "filesize": fsize,
+                            "filesize": _fmt_size(fp.stat().st_size),
                         }) + "\n"
 
-                # Detect 100% download for non-merged (audio only) files
                 if "[download] 100%" in line and last_filename and not merging:
                     fp = DOWNLOAD_DIR / last_filename
                     if fp.exists() and last_filename not in seen_ready:
                         seen_ready.add(last_filename)
-                        fsize = _fmt_size(fp.stat().st_size)
                         yield json.dumps({
                             "type": "file_ready",
                             "filename": last_filename,
-                            "filesize": fsize,
+                            "filesize": _fmt_size(fp.stat().st_size),
                         }) + "\n"
 
             process.wait()
 
-            # Any new files not yet announced
             after = set(f.name for f in DOWNLOAD_DIR.iterdir() if f.is_file())
-            new_files = after - before - seen_ready
-            for fname in new_files:
+            for fname in after - before - seen_ready:
                 fp = DOWNLOAD_DIR / fname
-                fsize = _fmt_size(fp.stat().st_size)
                 yield json.dumps({
                     "type": "file_ready",
                     "filename": fname,
-                    "filesize": fsize,
+                    "filesize": _fmt_size(fp.stat().st_size),
                 }) + "\n"
 
             if process.returncode == 0:
@@ -246,5 +269,5 @@ def list_files():
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    print(f"✓ VidGrab v2.0 → http://localhost:{port}")
+    print(f"✓ VidGrab v3.0 → http://localhost:{port}")
     app.run(host="0.0.0.0", port=port, debug=False)
