@@ -54,6 +54,21 @@ def download():
         try:
             args = shlex.split(raw)
 
+            # Try browsers in order for cookie extraction
+            cookie_args = []
+            for browser in ["chrome", "firefox", "edge", "chromium"]:
+                try:
+                    test = subprocess.run(
+                        ["yt-dlp", "--cookies-from-browser", browser, "--skip-download",
+                         "--quiet", "https://www.youtube.com/watch?v=dQw4w9WgXcQ"],
+                        capture_output=True, text=True, timeout=10
+                    )
+                    if test.returncode == 0 or "Sign in" not in test.stderr:
+                        cookie_args = ["--cookies-from-browser", browser]
+                        break
+                except Exception:
+                    continue
+
             cmd = [
                 "yt-dlp",
                 "--newline",
@@ -62,16 +77,19 @@ def download():
                 "--no-check-certificates",
                 "--restrict-filenames",
                 "--no-part",
+                "--js-runtimes", "deno",
+            ] + cookie_args + [
                 "-o", "download/%(playlist_index)s-%(title)s.%(ext)s"
                        if any(a in raw for a in ["--playlist", "playlist_items", "playlist-start"])
                        else "download/%(title)s.%(ext)s",
             ] + args
 
-            # Remove duplicate -o
+            # Remove duplicate -o and --cookies-from-browser flags from user args
             filtered, skip = [], False
             for i, a in enumerate(cmd):
                 if skip: skip = False; continue
-                if a == "-o" and i > 8: skip = True; continue
+                if a == "-o" and i > 12: skip = True; continue
+                if a == "--cookies-from-browser" and i > 12: skip = True; continue
                 filtered.append(a)
 
             # Track files seen before this run
